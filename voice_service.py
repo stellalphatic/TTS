@@ -8,12 +8,18 @@ import hmac
 import time
 import base64
 import io
-import urllib.request
+import urllib.request 
 
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 
+# NEW IMPORTS for WAV conversion
+import numpy as np
+from scipy.io import wavfile
+
+# Ensure you have these installed:
+# pip install websockets torch torchaudio TTS numpy scipy huggingface_hub
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -225,18 +231,28 @@ async def voice_chat_websocket_handler(websocket, path):
                     await websocket.send(json.dumps({"type": "speech_start"}))
 
                     # Generate and stream audio chunks using inference_stream
-                    chunks = xtts_model.inference_stream(
+                    for chunk in xtts_model.inference_stream(
                         text=text,
                         language="en", # Or detect language, or pass from Node.js
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
                         # Add other inference parameters if needed, e.g., temperature, top_k, top_p
-                    )
+                    ):
+                        # `chunk` is a torch.Tensor (float32). Convert to numpy and then to WAV bytes.
+                        audio_np = chunk.cpu().numpy()
 
-                    for chunk in chunks:
-                        # `chunk` is a torch.Tensor. Convert to numpy and then bytes.
-                        # Ensure it's on CPU before converting to numpy for sending.
-                        await websocket.send(chunk.cpu().numpy().tobytes())
+                        # Normalize float32 to int16 range and convert type for WAV
+                        # XTTS outputs float32 in range [-1, 1]. Convert to int16.
+                        # Multiply by 32767 for the full range of int16.
+                        audio_np_int16 = (audio_np * 32767).astype(np.int16)
+
+                        # Create an in-memory WAV file for each chunk
+                        wav_buffer = io.BytesIO()
+                        # XTTS-v2 typically outputs at 24000 Hz sample rate
+                        wavfile.write(wav_buffer, 24000, audio_np_int16)
+                        wav_bytes = wav_buffer.getvalue()
+
+                        await websocket.send(wav_bytes)
 
                     await websocket.send(json.dumps({"type": "speech_end"}))
                     logging.info("Finished streaming speech.")
