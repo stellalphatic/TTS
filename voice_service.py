@@ -9,7 +9,8 @@ import hmac
 import time
 import base64
 import io
-import urllib.request 
+import urllib.request
+
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -17,9 +18,10 @@ logging.getLogger('websockets.server').setLevel(logging.WARNING)
 logging.getLogger('websockets.protocol').setLevel(logging.WARNING)
 logging.getLogger('TTS.api').setLevel(logging.WARNING)
 logging.getLogger('TTS.utils.io').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING) 
+logging.getLogger('urllib3').setLevel(logging.WARNING) # Suppress urllib3 warnings
+logging.getLogger('huggingface_hub').setLevel(logging.WARNING) # Suppress huggingface_hub warnings
 
-
+# --- Configuration ---
 VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
 VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765))
 VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
@@ -29,7 +31,12 @@ TTS_MODEL_HOME = os.environ.get("TTS_HOME")
 if not TTS_MODEL_HOME:
     logging.error("TTS_HOME environment variable not set. Model loading might fail.")
     # Fallback to default if not set, but pre-downloading is preferred.
-    TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts") 
+    TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts")
+
+# Define explicit paths to the model files based on TTS_HOME
+# These are the files downloaded by download_model.py
+XTTS_MODEL_PATH = os.path.join(TTS_MODEL_HOME, "model.pth")
+XTTS_CONFIG_PATH = os.path.join(TTS_MODEL_HOME, "config.json")
 
 # --- Coqui TTS Model Loading ---
 tts_model = None
@@ -42,13 +49,13 @@ async def load_tts_model():
         logging.info(f"Loading Coqui TTS XTTS-v2 model from {TTS_MODEL_HOME}...")
         try:
             from TTS.api import TTS
-            # Explicitly pass model_path and config_path to ensure it loads from the pre-downloaded location
-            # The TTS library will find the files in TTS_MODEL_HOME if it's set correctly.
-            tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", 
-                            progress_bar=False, 
-                            gpu=True, 
-                            model_path=None,
-                            config_path=None) 
+            # Explicitly pass model_path and config_path to tell TTS where the files are
+            # This should prevent it from trying to re-download or prompt.
+            tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2",
+                            progress_bar=False,
+                            gpu=True, # Ensure this is True if you have GPU enabled on Cloud Run
+                            model_path=XTTS_MODEL_PATH,
+                            config_path=XTTS_CONFIG_PATH)
             logging.info("Coqui TTS XTTS-v2 model loaded successfully.")
         except Exception as e:
             logging.error(f"Failed to load Coqui TTS model: {e}")
@@ -69,11 +76,9 @@ async def get_speaker_embedding(voice_clone_url, avatar_id):
 
         file_extension = voice_clone_url.split('.')[-1].split('?')[0] # Handle query params in URL
         local_path = os.path.join(avatar_sample_dir, f"sample.{file_extension}")
-        
-        # Use a more robust way to download, e.g., requests library if not already installed,
-        # or handle errors for urllib.request.urlretrieve
+
         urllib.request.urlretrieve(voice_clone_url, local_path)
-        
+
         logging.info(f"Voice sample downloaded to: {local_path}")
 
         speaker_embeddings[avatar_id] = local_path
@@ -95,7 +100,7 @@ def verify_auth_token(token_header):
         missing_padding = len(encoded_payload) % 4
         if missing_padding:
             encoded_payload += '=' * (4 - missing_padding)
-            
+
         decoded_payload = base64.urlsafe_b64decode(encoded_payload).decode('utf-8')
         signature, timestamp_str = decoded_payload.split('.')
         timestamp = int(timestamp_str)
@@ -139,7 +144,7 @@ async def voice_chat_websocket_handler(websocket, path):
     user_id = None
     avatar_id = None
     speaker_wav_path = None
-    
+
     try:
         # First message should be 'init'
         init_message_raw = await websocket.recv()
@@ -188,8 +193,6 @@ async def voice_chat_websocket_handler(websocket, path):
                     await websocket.send(json.dumps({"type": "speech_start"}))
 
                     # Generate and stream audio chunks
-                    # Coqui TTS XTTS-v2 generates in chunks by default for streaming
-                    # The `stream=True` is implicit in how it works for real-time.
                     for chunk in tts_model.tts_stream(
                         text=text,
                         speaker_wav=speaker_wav_path,
@@ -206,7 +209,7 @@ async def voice_chat_websocket_handler(websocket, path):
                 elif msg_type == 'stop_speaking':
                     logging.info("Received stop_speaking command. (Coqui TTS handles interruption internally if it's mid-stream)")
                     await websocket.send(json.dumps({"type": "speech_end"})) # Ensure frontend gets end signal
-                
+
                 else:
                     logging.warning(f"Received unknown message type: {msg_type}")
 
@@ -241,11 +244,10 @@ async def main():
     await server.wait_closed()
 
 if __name__ == "__main__":
-    # Ensure VOICE_SERVICE_SECRET_KEY is set
     if not VOICE_SERVICE_SECRET_KEY:
         logging.error("VOICE_SERVICE_SECRET_KEY environment variable is not set. Exiting.")
         exit(1)
-    
+
     # Ensure TTS_HOME is set for local testing, though Dockerfile sets it for deployment
     if not TTS_MODEL_HOME:
         logging.warning("TTS_HOME environment variable not set. Using default user cache path.")
