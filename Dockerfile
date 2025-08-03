@@ -12,6 +12,8 @@ ENV TTS_HOME=/app/.tts_models
 
 ENV HF_HOME=${TTS_HOME}
 
+ENV COQUI_TOS_AGREED=1
+
 RUN mkdir -p ${TTS_HOME}
 
 COPY requirements.txt .
