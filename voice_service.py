@@ -9,8 +9,7 @@ import hmac
 import time
 import base64
 import io
-import urllib.request
-
+import urllib.request 
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +19,7 @@ logging.getLogger('TTS.api').setLevel(logging.WARNING)
 logging.getLogger('TTS.utils.io').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING) # Suppress urllib3 warnings
 logging.getLogger('huggingface_hub').setLevel(logging.WARNING) # Suppress huggingface_hub warnings
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING) # Suppress matplotlib font warnings
 
 # --- Configuration ---
 VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
@@ -33,10 +33,14 @@ if not TTS_MODEL_HOME:
     # Fallback to default if not set, but pre-downloading is preferred.
     TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts")
 
-# Define explicit paths to the model files based on TTS_HOME
-# These are the files downloaded by download_model.py
-XTTS_MODEL_PATH = os.path.join(TTS_MODEL_HOME, "model.pth")
-XTTS_CONFIG_PATH = os.path.join(TTS_MODEL_HOME, "config.json")
+# Define the full target directory path where model files are located
+# This MUST match the full_cache_dir in download_model.py
+TARGET_MODEL_DIR_SUFFIX = "tts_models/multilingual/multi-dataset/xtts_v2"
+XTTS_MODEL_FILES_DIR = os.path.join(TTS_MODEL_HOME, TARGET_MODEL_DIR_SUFFIX)
+
+# Define explicit paths to the model files based on the actual download location
+XTTS_MODEL_PATH = os.path.join(XTTS_MODEL_FILES_DIR, "model.pth")
+XTTS_CONFIG_PATH = os.path.join(XTTS_MODEL_FILES_DIR, "config.json")
 
 # --- Coqui TTS Model Loading ---
 tts_model = None
@@ -46,7 +50,13 @@ async def load_tts_model():
     """Loads the Coqui TTS XTTS-v2 model globally."""
     global tts_model
     if tts_model is None:
-        logging.info(f"Loading Coqui TTS XTTS-v2 model from {TTS_MODEL_HOME}...")
+        # Check if the expected model files exist
+        if not os.path.exists(XTTS_MODEL_PATH) or not os.path.exists(XTTS_CONFIG_PATH):
+            logging.error(f"Model files not found in expected directory: {XTTS_MODEL_FILES_DIR}")
+            logging.error("Please ensure the Docker build successfully pre-downloaded the model.")
+            raise FileNotFoundError(f"Missing XTTS-v2 model files in {XTTS_MODEL_FILES_DIR}")
+
+        logging.info(f"Loading Coqui TTS XTTS-v2 model from {XTTS_MODEL_FILES_DIR}...")
         try:
             from TTS.api import TTS
             # Explicitly pass model_path and config_path to tell TTS where the files are
@@ -71,6 +81,7 @@ async def get_speaker_embedding(voice_clone_url, avatar_id):
     logging.info(f"Downloading voice sample from: {voice_clone_url}")
     try:
         # Create a unique directory for each avatar's voice sample to avoid conflicts
+        # This will be created within the main TTS_MODEL_HOME, not the nested model dir
         avatar_sample_dir = os.path.join(TTS_MODEL_HOME, "voice_samples", str(avatar_id))
         os.makedirs(avatar_sample_dir, exist_ok=True)
 
@@ -248,9 +259,7 @@ if __name__ == "__main__":
         logging.error("VOICE_SERVICE_SECRET_KEY environment variable is not set. Exiting.")
         exit(1)
 
-    # Ensure TTS_HOME is set for local testing, though Dockerfile sets it for deployment
     if not TTS_MODEL_HOME:
         logging.warning("TTS_HOME environment variable not set. Using default user cache path.")
-        # This warning will appear if running locally without TTS_HOME set, but not in Docker.
 
     asyncio.run(main())
