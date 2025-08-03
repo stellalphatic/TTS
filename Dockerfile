@@ -16,23 +16,8 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-# --- CRITICAL CHANGE: Pre-download the XTTS-v2 model non-interactively ---
-# Use huggingface_hub to download the model directly into the TTS_HOME directory.
-# This bypasses the interactive prompt.
-RUN python -c 'import os\n\
-from huggingface_hub import hf_hub_download\n\
-model_repo = "coqui/XTTS-v2"\n\
-model_files = [\n\
-    "model.json",\n\
-    "vocab.json",\n\
-    "config.json",\n\
-    "dvae.pth",\n\
-    "gpt_weights.pth",\n\
-    "speaker_encoder.pth"\n\
-]\n\
-for file_name in model_files:\n\
-    hf_hub_download(repo_id=model_repo, filename=file_name, cache_dir=os.environ.get("TTS_HOME"))\n\
-print("XTTS-v2 model pre-downloaded successfully!")'
+COPY download_model.py .
+RUN python download_model.py
 
 COPY voice_service.py .
 
