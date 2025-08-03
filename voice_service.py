@@ -9,10 +9,7 @@ import hmac
 import time
 import base64
 import io
-import urllib.request
-
-# Ensure you have these installed:
-# pip install websockets torch torchaudio TTS numpy scipy
+import urllib.request 
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -20,9 +17,9 @@ logging.getLogger('websockets.server').setLevel(logging.WARNING)
 logging.getLogger('websockets.protocol').setLevel(logging.WARNING)
 logging.getLogger('TTS.api').setLevel(logging.WARNING)
 logging.getLogger('TTS.utils.io').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING) # Suppress urllib3 warnings
+logging.getLogger('urllib3').setLevel(logging.WARNING) 
 
-# --- Configuration ---
+
 VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
 VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765))
 VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
@@ -49,9 +46,9 @@ async def load_tts_model():
             # The TTS library will find the files in TTS_MODEL_HOME if it's set correctly.
             tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", 
                             progress_bar=False, 
-                            gpu=True, # Ensure this is True if you have GPU enabled on Cloud Run
-                            model_path=None, # Let TTS infer from TTS_HOME
-                            config_path=None) # Let TTS infer from TTS_HOME
+                            gpu=True, 
+                            model_path=None,
+                            config_path=None) 
             logging.info("Coqui TTS XTTS-v2 model loaded successfully.")
         except Exception as e:
             logging.error(f"Failed to load Coqui TTS model: {e}")
