@@ -23,8 +23,12 @@ RUN python -c 'import os\n\
 from huggingface_hub import hf_hub_download\n\
 model_repo = "coqui/XTTS-v2"\n\
 model_files = [\n\
-    "model.json", "vocab.json", "config.json",\n\
-    "dvae.pth", "gpt_weights.pth", "speaker_encoder.pth"\n\
+    "model.json",\n\
+    "vocab.json",\n\
+    "config.json",\n\
+    "dvae.pth",\n\
+    "gpt_weights.pth",\n\
+    "speaker_encoder.pth"\n\
 ]\n\
 for file_name in model_files:\n\
     hf_hub_download(repo_id=model_repo, filename=file_name, cache_dir=os.environ.get("TTS_HOME"))\n\
