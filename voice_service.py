@@ -1,4 +1,3 @@
-
 import asyncio
 import websockets
 import json
@@ -9,7 +8,12 @@ import hmac
 import time
 import base64
 import io
-import urllib.request 
+import urllib.request
+
+import torch
+from TTS.tts.configs.xtts_config import XttsConfig
+from TTS.tts.models.xtts import Xtts
+
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +24,8 @@ logging.getLogger('TTS.utils.io').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING) # Suppress urllib3 warnings
 logging.getLogger('huggingface_hub').setLevel(logging.WARNING) # Suppress huggingface_hub warnings
 logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING) # Suppress matplotlib font warnings
+logging.getLogger('fsspec').setLevel(logging.WARNING) # Suppress fsspec warnings
+
 
 # --- Configuration ---
 VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
@@ -31,41 +37,59 @@ VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
 TTS_MODEL_HOME = os.environ.get("TTS_HOME")
 if not TTS_MODEL_HOME:
     logging.error("TTS_HOME environment variable not set. Model loading might fail.")
-    # Fallback to default if not set, but pre-downloading is preferred.
     TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts")
 
+# Define the full path to the directory containing the downloaded model files
+# This is where download_model.py places the files (HF_HOME root)
+XTTS_MODEL_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # This gets the latest snapshot hash dynamically
+
+XTTS_CONFIG_PATH = os.path.join(XTTS_MODEL_DIR, "config.json")
+XTTS_CHECKPOINT_DIR = XTTS_MODEL_DIR # checkpoint_dir is the directory containing model.pth, etc.
+
 # --- Coqui TTS Model Loading ---
-tts_model = None
-speaker_embeddings = {} # Cache speaker embeddings for performance
+xtts_model = None
+# Cache speaker latents (gpt_cond_latent, speaker_embedding) for performance
+speaker_latents_cache = {}
 
 async def load_tts_model():
-    """Loads the Coqui TTS XTTS-v2 model globally."""
-    global tts_model
-    if tts_model is None:
-        logging.info(f"Loading Coqui TTS XTTS-v2 model (HF_HOME={TTS_MODEL_HOME})...")
+    """Loads the Coqui XTTS model and configuration globally."""
+    global xtts_model
+    if xtts_model is None:
+        logging.info(f"Loading Coqui XTTS-v2 model from {XTTS_MODEL_DIR}...")
         try:
-            from TTS.api import TTS
-            # Do NOT pass model_path and config_path.
-            # TTS will find them automatically because HF_HOME is set to TTS_MODEL_HOME.
-            tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2",
-                            progress_bar=False,
-                            gpu=True) # Ensure this is True if you have GPU enabled on Cloud Run
-            logging.info("Coqui TTS XTTS-v2 model loaded successfully.")
+            # 1. Load config
+            config = XttsConfig()
+            config.load_json(XTTS_CONFIG_PATH)
+
+            # 2. Initialize model
+            xtts_model = Xtts.init_from_config(config)
+
+            # 3. Load checkpoint
+            # use_deepspeed=False for now, as it adds complexity and might not be needed initially
+            xtts_model.load_checkpoint(config, checkpoint_dir=XTTS_CHECKPOINT_DIR, use_deepspeed=False)
+
+            # 4. Move model to GPU if available
+            if torch.cuda.is_available():
+                xtts_model.cuda()
+                logging.info("Coqui XTTS-v2 model moved to CUDA (GPU).")
+            else:
+                logging.info("No CUDA (GPU) available, Coqui XTTS-v2 model loaded on CPU.")
+
+            logging.info("Coqui XTTS-v2 model loaded successfully.")
         except Exception as e:
-            logging.error(f"Failed to load Coqui TTS model: {e}")
-            tts_model = None
+            logging.error(f"Failed to load Coqui XTTS model: {e}")
+            xtts_model = None
             raise
 
-async def get_speaker_embedding(voice_clone_url, avatar_id):
-    """Downloads voice sample and computes speaker embedding, caches it."""
-    if avatar_id in speaker_embeddings:
-        logging.info(f"Using cached speaker embedding for avatar {avatar_id}")
-        return speaker_embeddings[avatar_id]
+async def get_speaker_latents(voice_clone_url, avatar_id):
+    """Downloads voice sample and computes speaker latents, caches them."""
+    if avatar_id in speaker_latents_cache:
+        logging.info(f"Using cached speaker latents for avatar {avatar_id}")
+        return speaker_latents_cache[avatar_id]
 
     logging.info(f"Downloading voice sample from: {voice_clone_url}")
     try:
         # Create a unique directory for each avatar's voice sample to avoid conflicts
-        # This will be created within the main TTS_MODEL_HOME, not the nested model dir
         avatar_sample_dir = os.path.join(TTS_MODEL_HOME, "voice_samples", str(avatar_id))
         os.makedirs(avatar_sample_dir, exist_ok=True)
 
@@ -76,11 +100,23 @@ async def get_speaker_embedding(voice_clone_url, avatar_id):
 
         logging.info(f"Voice sample downloaded to: {local_path}")
 
-        speaker_embeddings[avatar_id] = local_path
-        return local_path
+        # Compute speaker latents
+        if xtts_model is None:
+            raise RuntimeError("XTTS model not loaded to compute speaker latents.")
+
+        # Ensure model is on the correct device for get_conditioning_latents
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        xtts_model.to(device)
+
+        logging.info(f"Computing speaker latents for {avatar_id} on {device}...")
+        gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(audio_path=[local_path])
+        logging.info(f"Speaker latents computed for {avatar_id}.")
+
+        speaker_latents_cache[avatar_id] = (gpt_cond_latent, speaker_embedding)
+        return gpt_cond_latent, speaker_embedding
     except Exception as e:
-        logging.error(f"Error downloading or processing voice sample: {e}")
-        return None
+        logging.error(f"Error downloading or processing voice sample/computing latents: {e}")
+        return None, None
 
 # --- WebSocket Authentication ---
 def verify_auth_token(token_header):
@@ -138,7 +174,8 @@ async def voice_chat_websocket_handler(websocket, path):
 
     user_id = None
     avatar_id = None
-    speaker_wav_path = None
+    gpt_cond_latent = None
+    speaker_embedding = None
 
     try:
         # First message should be 'init'
@@ -161,13 +198,13 @@ async def voice_chat_websocket_handler(websocket, path):
 
         logging.info(f"Initializing voice for user {user_id}, avatar {avatar_id} from {voice_clone_url}")
 
-        speaker_wav_path = await get_speaker_embedding(voice_clone_url, avatar_id)
-        if not speaker_wav_path:
-            await websocket.send(json.dumps({"type": "error", "message": "Failed to load voice sample."}))
+        gpt_cond_latent, speaker_embedding = await get_speaker_latents(voice_clone_url, avatar_id)
+        if gpt_cond_latent is None or speaker_embedding is None:
+            await websocket.send(json.dumps({"type": "error", "message": "Failed to load voice sample or compute latents."}))
             return
 
-        if tts_model is None:
-            await websocket.send(json.dumps({"type": "error", "message": "TTS model not loaded on server."}))
+        if xtts_model is None:
+            await websocket.send(json.dumps({"type": "error", "message": "XTTS model not loaded on server."}))
             return
 
         await websocket.send(json.dumps({"type": "ready", "message": "Voice service ready."}))
@@ -187,16 +224,19 @@ async def voice_chat_websocket_handler(websocket, path):
                     logging.info(f"Generating speech for text: '{text[:50]}...'")
                     await websocket.send(json.dumps({"type": "speech_start"}))
 
-                    # Generate and stream audio chunks
-                    for chunk in tts_model.tts_stream(
+                    # Generate and stream audio chunks using inference_stream
+                    chunks = xtts_model.inference_stream(
                         text=text,
-                        speaker_wav=speaker_wav_path,
-                        language="en" # Or detect language, or pass from Node.js
-                    ):
-                        # `chunk` is a numpy array (float32). Convert to bytes.
-                        # Frontend needs to know sample rate (24kHz for XTTS-v2)
-                        # and convert float32 to AudioBuffer.
-                        await websocket.send(chunk.tobytes())
+                        language="en", # Or detect language, or pass from Node.js
+                        gpt_cond_latent=gpt_cond_latent,
+                        speaker_embedding=speaker_embedding,
+                        # Add other inference parameters if needed, e.g., temperature, top_k, top_p
+                    )
+
+                    for chunk in chunks:
+                        # `chunk` is a torch.Tensor. Convert to numpy and then bytes.
+                        # Ensure it's on CPU before converting to numpy for sending.
+                        await websocket.send(chunk.cpu().numpy().tobytes())
 
                     await websocket.send(json.dumps({"type": "speech_end"}))
                     logging.info("Finished streaming speech.")
@@ -245,4 +285,5 @@ if __name__ == "__main__":
 
     if not TTS_MODEL_HOME:
         logging.warning("TTS_HOME environment variable not set. Using default user cache path.")
+
     asyncio.run(main())
