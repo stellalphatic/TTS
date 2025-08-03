@@ -8,7 +8,7 @@ import hmac
 import time
 import base64
 import io
-import urllib.request 
+import urllib.request
 
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -49,8 +49,9 @@ if not TTS_MODEL_HOME:
 # This is where download_model.py places the files (HF_HOME root)
 XTTS_MODEL_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # This gets the latest snapshot hash dynamically
 
-XTTS_CONFIG_PATH = os.path.join(XTTS_MODEL_DIR, "config.json")
-XTTS_CHECKPOINT_DIR = XTTS_MODEL_DIR # checkpoint_dir is the directory containing model.pth, etc.
+XTTS_CONFIG_PATH = os.path.join(XTTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0], "config.json")
+XTTS_CHECKPOINT_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # checkpoint_dir is the directory containing model.pth, etc.
+
 
 # --- Coqui TTS Model Loading ---
 xtts_model = None
@@ -182,6 +183,7 @@ async def voice_chat_websocket_handler(websocket, path):
     avatar_id = None
     gpt_cond_latent = None
     speaker_embedding = None
+    language = 'en' # NEW: Initialize language
 
     try:
         # First message should be 'init'
@@ -196,13 +198,14 @@ async def voice_chat_websocket_handler(websocket, path):
         user_id = init_message.get('userId')
         avatar_id = init_message.get('avatarId')
         voice_clone_url = init_message.get('voice_clone_url')
+        language = init_message.get('language', 'en') # NEW: Get language from init message
 
         if not all([user_id, avatar_id, voice_clone_url]):
             logging.error("Missing init parameters. Closing connection.")
             await websocket.send(json.dumps({"type": "error", "message": "Missing userId, avatarId, or voice_clone_url in init."}))
             return
 
-        logging.info(f"Initializing voice for user {user_id}, avatar {avatar_id} from {voice_clone_url}")
+        logging.info(f"Initializing voice for user {user_id}, avatar {avatar_id} from {voice_clone_url} in language {language}") # NEW: Log language
 
         gpt_cond_latent, speaker_embedding = await get_speaker_latents(voice_clone_url, avatar_id)
         if gpt_cond_latent is None or speaker_embedding is None:
@@ -227,13 +230,13 @@ async def voice_chat_websocket_handler(websocket, path):
                         logging.warning("Received empty text_to_speak message.")
                         continue
 
-                    logging.info(f"Generating speech for text: '{text[:50]}...'")
+                    logging.info(f"Generating speech for text: '{text[:50]}...' in language '{language}'") # NEW: Log language
                     await websocket.send(json.dumps({"type": "speech_start"}))
 
                     # Generate and stream audio chunks using inference_stream
                     for chunk in xtts_model.inference_stream(
                         text=text,
-                        language="en", # Or detect language, or pass from Node.js
+                        language=language, # NEW: Pass language to XTTS
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
                         # Add other inference parameters if needed, e.g., temperature, top_k, top_p
