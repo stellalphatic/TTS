@@ -8,7 +8,7 @@ import hmac
 import time
 import base64
 import io
-import urllib.request
+import urllib.request 
 
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -17,9 +17,6 @@ from TTS.tts.models.xtts import Xtts
 # NEW IMPORTS for WAV conversion
 import numpy as np
 from scipy.io import wavfile
-
-# Ensure you have these installed:
-# pip install websockets torch torchaudio TTS numpy scipy huggingface_hub
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -49,7 +46,8 @@ if not TTS_MODEL_HOME:
 # This is where download_model.py places the files (HF_HOME root)
 XTTS_MODEL_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # This gets the latest snapshot hash dynamically
 
-XTTS_CONFIG_PATH = os.path.join(XTTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0], "config.json")
+# FIX: Changed XTTS_MODEL_HOME to TTS_MODEL_HOME in the following two lines
+XTTS_CONFIG_PATH = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0], "config.json")
 XTTS_CHECKPOINT_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # checkpoint_dir is the directory containing model.pth, etc.
 
 
