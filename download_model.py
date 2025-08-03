@@ -9,13 +9,14 @@ if not tts_home:
     exit(1)
 
 model_repo = "coqui/XTTS-v2"
+
 model_files = [
-    "model.json",
-    "vocab.json",
     "config.json",
     "dvae.pth",
-    "gpt_weights.pth",
-    "speaker_encoder.pth"
+    "model.pth",         
+    "speakers_xtts.pth", 
+    "vocab.json",
+    "mel_stats.pth"       
 ]
 
 print(f"Starting XTTS-v2 model pre-download to {tts_home}...")
@@ -26,6 +27,7 @@ for file_name in model_files:
         print(f"Downloaded: {file_name}")
     except Exception as e:
         print(f"Error downloading {file_name}: {e}")
-        exit(1) # Exit if any download fails
+        exit(1) 
 
 print("XTTS-v2 model pre-downloaded successfully!")
+
