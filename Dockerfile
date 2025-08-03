@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ENV TTS_HOME=/app/.tts_models
 
+ENV HF_HOME=${TTS_HOME}
+
 RUN mkdir -p ${TTS_HOME}
 
 COPY requirements.txt .
@@ -20,7 +22,6 @@ COPY download_model.py .
 RUN python download_model.py
 
 COPY voice_service.py .
-
 EXPOSE 8765
 
 CMD ["python", "voice_service.py"]

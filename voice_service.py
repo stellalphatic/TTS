@@ -27,21 +27,12 @@ VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765))
 VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
 
 # TTS_HOME will be set by the Dockerfile during build and available at runtime
+# This is also set as HF_HOME in the Dockerfile.
 TTS_MODEL_HOME = os.environ.get("TTS_HOME")
 if not TTS_MODEL_HOME:
     logging.error("TTS_HOME environment variable not set. Model loading might fail.")
     # Fallback to default if not set, but pre-downloading is preferred.
     TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts")
-
-# Define the full target directory path where model files are actually located
-# This includes the repo_id 'coqui/XTTS-v2' as hf_hub_download creates this nested structure.
-TARGET_MODEL_DIR_SUFFIX = os.path.join("tts_models", "multilingual", "multi-dataset", "xtts_v2", "coqui", "XTTS-v2") # ADDED "coqui/XTTS-v2"
-FULL_HF_CACHE_DIR = os.path.join(TTS_MODEL_HOME, TARGET_MODEL_DIR_SUFFIX)
-
-
-# Define explicit paths to the model files based on the actual download location
-XTTS_MODEL_PATH = os.path.join(FULL_HF_CACHE_DIR, "model.pth")
-XTTS_CONFIG_PATH = os.path.join(FULL_HF_CACHE_DIR, "config.json")
 
 # --- Coqui TTS Model Loading ---
 tts_model = None
@@ -51,22 +42,14 @@ async def load_tts_model():
     """Loads the Coqui TTS XTTS-v2 model globally."""
     global tts_model
     if tts_model is None:
-        # Check if the expected model files exist
-        if not os.path.exists(XTTS_MODEL_PATH) or not os.path.exists(XTTS_CONFIG_PATH):
-            logging.error(f"Model files not found in expected directory: {FULL_HF_CACHE_DIR}") # Changed variable name
-            logging.error("Please ensure the Docker build successfully pre-downloaded the model.")
-            raise FileNotFoundError(f"Missing XTTS-v2 model files in {FULL_HF_CACHE_DIR}") # Changed variable name
-
-        logging.info(f"Loading Coqui TTS XTTS-v2 model from {FULL_HF_CACHE_DIR}...") # Changed variable name
+        logging.info(f"Loading Coqui TTS XTTS-v2 model (HF_HOME={TTS_MODEL_HOME})...")
         try:
             from TTS.api import TTS
-            # Explicitly pass model_path and config_path to tell TTS where the files are
-            # This should prevent it from trying to re-download or prompt.
+            # Do NOT pass model_path and config_path.
+            # TTS will find them automatically because HF_HOME is set to TTS_MODEL_HOME.
             tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2",
                             progress_bar=False,
-                            gpu=True, # Ensure this is True if you have GPU enabled on Cloud Run
-                            model_path=XTTS_MODEL_PATH,
-                            config_path=XTTS_CONFIG_PATH)
+                            gpu=True) # Ensure this is True if you have GPU enabled on Cloud Run
             logging.info("Coqui TTS XTTS-v2 model loaded successfully.")
         except Exception as e:
             logging.error(f"Failed to load Coqui TTS model: {e}")
@@ -256,14 +239,10 @@ async def main():
     await server.wait_closed()
 
 if __name__ == "__main__":
-    # Ensure VOICE_SERVICE_SECRET_KEY is set
     if not VOICE_SERVICE_SECRET_KEY:
         logging.error("VOICE_SERVICE_SECRET_KEY environment variable is not set. Exiting.")
         exit(1)
 
-    # Ensure TTS_HOME is set for local testing, though Dockerfile sets it for deployment
     if not TTS_MODEL_HOME:
         logging.warning("TTS_HOME environment variable not set. Using default user cache path.")
-        # This warning will appear if running locally without TTS_HOME set, but not in Docker.
-
     asyncio.run(main())
