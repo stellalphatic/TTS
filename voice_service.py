@@ -9,10 +9,10 @@ import hmac
 import time
 import base64
 import io
-import urllib.request # For downloading voice samples
+import urllib.request
 
 # Ensure you have these installed:
-# pip install websockets torch torchaudio TTS numpy
+# pip install websockets torch torchaudio TTS numpy scipy
 
 # Suppress excessive logging from libraries
 logging.basicConfig(level=logging.INFO)
@@ -20,26 +20,21 @@ logging.getLogger('websockets.server').setLevel(logging.WARNING)
 logging.getLogger('websockets.protocol').setLevel(logging.WARNING)
 logging.getLogger('TTS.api').setLevel(logging.WARNING)
 logging.getLogger('TTS.utils.io').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING) # Suppress urllib3 warnings
 
 # --- Configuration ---
-# Use environment variables for sensitive data and URLs
 VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
-VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765)) # Default port for WS
-VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0") # Listen on all interfaces
+VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765))
+VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
 
-# Path to store downloaded voice samples temporarily
-VOICE_SAMPLES_DIR = "voice_samples"
-os.makedirs(VOICE_SAMPLES_DIR, exist_ok=True)
+# TTS_HOME will be set by the Dockerfile during build and available at runtime
+TTS_MODEL_HOME = os.environ.get("TTS_HOME")
+if not TTS_MODEL_HOME:
+    logging.error("TTS_HOME environment variable not set. Model loading might fail.")
+    # Fallback to default if not set, but pre-downloading is preferred.
+    TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts") 
 
 # --- Coqui TTS Model Loading ---
-# This part can take time and memory. Load once globally.
-# Ensure you have downloaded the XTTS-v2 model.
-# The `TTS` library will download it automatically if not found,
-# but it's better to pre-download for deployment.
-# Example download: python -m TTS --model_name "tts_models/multilingual/multi-dataset/xtts_v2" --list_models
-# Then TTS().load_model_by_name("tts_models/multilingual/multi-dataset/xtts_v2")
-# You might need to specify model path if not using default download location.
-
 tts_model = None
 speaker_embeddings = {} # Cache speaker embeddings for performance
 
@@ -47,16 +42,20 @@ async def load_tts_model():
     """Loads the Coqui TTS XTTS-v2 model globally."""
     global tts_model
     if tts_model is None:
-        logging.info("Loading Coqui TTS XTTS-v2 model...")
+        logging.info(f"Loading Coqui TTS XTTS-v2 model from {TTS_MODEL_HOME}...")
         try:
             from TTS.api import TTS
-            # This will download the model if it's not present.
-            # For production, consider pre-downloading and pointing to the path.
-            tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", progress_bar=False, gpu=False)
+            # Explicitly pass model_path and config_path to ensure it loads from the pre-downloaded location
+            # The TTS library will find the files in TTS_MODEL_HOME if it's set correctly.
+            tts_model = TTS(model_name="tts_models/multilingual/multi-dataset/xtts_v2", 
+                            progress_bar=False, 
+                            gpu=True, # Ensure this is True if you have GPU enabled on Cloud Run
+                            model_path=None, # Let TTS infer from TTS_HOME
+                            config_path=None) # Let TTS infer from TTS_HOME
             logging.info("Coqui TTS XTTS-v2 model loaded successfully.")
         except Exception as e:
             logging.error(f"Failed to load Coqui TTS model: {e}")
-            tts_model = None # Ensure it remains None if loading fails
+            tts_model = None
             raise
 
 async def get_speaker_embedding(voice_clone_url, avatar_id):
@@ -67,20 +66,21 @@ async def get_speaker_embedding(voice_clone_url, avatar_id):
 
     logging.info(f"Downloading voice sample from: {voice_clone_url}")
     try:
-        # Download the voice sample
-        file_extension = voice_clone_url.split('.')[-1]
-        local_path = os.path.join(VOICE_SAMPLES_DIR, f"{avatar_id}.{file_extension}")
+        # Create a unique directory for each avatar's voice sample to avoid conflicts
+        avatar_sample_dir = os.path.join(TTS_MODEL_HOME, "voice_samples", str(avatar_id))
+        os.makedirs(avatar_sample_dir, exist_ok=True)
+
+        file_extension = voice_clone_url.split('.')[-1].split('?')[0] # Handle query params in URL
+        local_path = os.path.join(avatar_sample_dir, f"sample.{file_extension}")
+        
+        # Use a more robust way to download, e.g., requests library if not already installed,
+        # or handle errors for urllib.request.urlretrieve
         urllib.request.urlretrieve(voice_clone_url, local_path)
         
         logging.info(f"Voice sample downloaded to: {local_path}")
 
-        # Compute speaker embedding
-        speaker_wav = local_path
-        # This function computes the embedding. XTTS-v2 handles this internally.
-        # For XTTS-v2, you typically pass the path directly to the TTS call.
-        # We'll store the path and let the TTS model handle the embedding on demand.
-        speaker_embeddings[avatar_id] = speaker_wav
-        return speaker_wav
+        speaker_embeddings[avatar_id] = local_path
+        return local_path
     except Exception as e:
         logging.error(f"Error downloading or processing voice sample: {e}")
         return None
@@ -94,7 +94,12 @@ def verify_auth_token(token_header):
 
     try:
         encoded_payload = token_header.split("VOICE_CLONE_AUTH-")[1]
-        decoded_payload = base64.urlsafe_b64decode(encoded_payload + '==').decode('utf-8') # Add padding back
+        # Add padding back for base64urldecode if missing
+        missing_padding = len(encoded_payload) % 4
+        if missing_padding:
+            encoded_payload += '=' * (4 - missing_padding)
+            
+        decoded_payload = base64.urlsafe_b64decode(encoded_payload).decode('utf-8')
         signature, timestamp_str = decoded_payload.split('.')
         timestamp = int(timestamp_str)
 
@@ -188,30 +193,13 @@ async def voice_chat_websocket_handler(websocket, path):
                     # Generate and stream audio chunks
                     # Coqui TTS XTTS-v2 generates in chunks by default for streaming
                     # The `stream=True` is implicit in how it works for real-time.
-                    # You might need to adjust chunk size or buffer for optimal real-time.
                     for chunk in tts_model.tts_stream(
                         text=text,
                         speaker_wav=speaker_wav_path,
                         language="en" # Or detect language, or pass from Node.js
                     ):
-                        # `chunk` is a numpy array. Convert to bytes.
-                        audio_bytes = io.BytesIO()
-                        # Assuming 16-bit PCM, 24kHz. Adjust format as per your frontend's AudioContext.
-                        # This conversion might need `scipy.io.wavfile.write` or `soundfile` for proper WAV headers
-                        # if your frontend expects WAV. For raw PCM, just convert numpy array to bytes.
-                        # For simplicity, sending raw PCM (float32). Frontend will need to handle this.
-                        # For better compatibility, convert to WAV or a common format.
-                        # Example for simple raw PCM (float32):
-                        # await websocket.send(chunk.tobytes())
-
-                        # For better compatibility, let's aim for 16-bit PCM WAV
-                        # You'd typically need `soundfile` or `scipy.io.wavfile` for proper WAV headers.
-                        # For this example, let's assume frontend can handle raw PCM or you'll add WAV header logic.
-                        # For now, sending raw float32 data.
-                        # Frontend will need to convert this float32 to AudioBuffer.
-                        # A more robust solution might use pydub to convert to common formats.
-                        
-                        # Simplest: send raw float32 bytes. Frontend needs to know sample rate (24kHz for XTTS-v2)
+                        # `chunk` is a numpy array (float32). Convert to bytes.
+                        # Frontend needs to know sample rate (24kHz for XTTS-v2)
                         # and convert float32 to AudioBuffer.
                         await websocket.send(chunk.tobytes())
 
@@ -220,10 +208,6 @@ async def voice_chat_websocket_handler(websocket, path):
 
                 elif msg_type == 'stop_speaking':
                     logging.info("Received stop_speaking command. (Coqui TTS handles interruption internally if it's mid-stream)")
-                    # Coqui TTS streaming usually stops on its own if the connection is closed
-                    # or if you stop feeding it text. No explicit 'stop' command needed for the model itself.
-                    # If you want to interrupt, you'd break the tts_stream loop if it were external.
-                    # For now, just acknowledge.
                     await websocket.send(json.dumps({"type": "speech_end"})) # Ensure frontend gets end signal
                 
                 else:
@@ -231,7 +215,6 @@ async def voice_chat_websocket_handler(websocket, path):
 
             except json.JSONDecodeError:
                 logging.warning("Received non-JSON message from Node.js. Ignoring.")
-                # This could be raw audio from frontend if STT was handled here, but it's not.
             except Exception as e:
                 logging.error(f"Error processing message from Node.js: {e}")
                 await websocket.send(json.dumps({"type": "error", "message": f"Server error: {e}"}))
@@ -244,7 +227,6 @@ async def voice_chat_websocket_handler(websocket, path):
         logging.error(f"Unexpected error in voice chat handler: {e}")
     finally:
         logging.info(f"Cleaning up connection for user {user_id}.")
-        # No explicit resource cleanup for Coqui model here, as it's global.
 
 async def main():
     """Main function to start the WebSocket server."""
@@ -256,7 +238,7 @@ async def main():
         voice_chat_websocket_handler,
         VOICE_SERVICE_HOST,
         VOICE_SERVICE_PORT,
-        ping_interval=None, # Disable ping/pong if not strictly needed for real-time
+        ping_interval=None, # Disable ping/pong for simplicity, can add if needed
         ping_timeout=None
     )
     await server.wait_closed()
@@ -267,4 +249,9 @@ if __name__ == "__main__":
         logging.error("VOICE_SERVICE_SECRET_KEY environment variable is not set. Exiting.")
         exit(1)
     
+    # Ensure TTS_HOME is set for local testing, though Dockerfile sets it for deployment
+    if not TTS_MODEL_HOME:
+        logging.warning("TTS_HOME environment variable not set. Using default user cache path.")
+        # This warning will appear if running locally without TTS_HOME set, but not in Docker.
+
     asyncio.run(main())
