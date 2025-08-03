@@ -1,7 +1,7 @@
 websockets==12.0
 torch==2.3.0
 torchaudio==2.3.0
-TTS==0.22.0
+TTS==0.21.1
 numpy==1.22.0 
 scipy==1.11.2
 huggingface_hub==0.23.0
