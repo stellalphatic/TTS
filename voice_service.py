@@ -369,8 +369,24 @@ async def generate_audio_http_handler(request):
             language=language,
         )
 
-        # Convert float32 numpy array to int16 WAV bytes
-        audio_np_int16 = (audio_array * 32767).astype(np.int16)
+        # --- DEBUGGING ADDITION ---
+        logging.info(f"DEBUG: Type returned by synthesize: {type(audio_array)}")
+        if isinstance(audio_array, dict):
+            logging.error(f"DEBUG: synthesize returned a dictionary: {audio_array}")
+            # If it's a dict, it's an unexpected error from the model.
+            return web.json_response({"error": "Internal voice service error: Model synthesis returned unexpected data (dictionary)."}, status=500)
+        # --- END DEBUGGING ADDITION ---
+
+        # Ensure it's a numpy array before multiplication
+        # This check is technically redundant if synthesize always returns torch.Tensor,
+        # but good for robustness if it sometimes returns other array-like objects.
+        if not isinstance(audio_array, torch.Tensor):
+            logging.error(f"Synthesize returned unexpected type: {type(audio_array)}. Expected torch.Tensor.")
+            return web.json_response({"error": "Internal voice service error: Model synthesis returned non-tensor data."}, status=500)
+
+        audio_np = audio_array.cpu().numpy()
+        audio_np_int16 = (audio_np * 32767).astype(np.int16)
+
         wav_buffer = io.BytesIO()
         wavfile.write(wav_buffer, 24000, audio_np_int16) # XTTS-v2 typically outputs at 24000 Hz
         wav_bytes = wav_buffer.getvalue()
