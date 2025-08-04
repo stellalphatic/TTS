@@ -61,11 +61,12 @@ except IndexError:
 
 # --- Coqui TTS Model Loading ---
 xtts_model = None
+xtts_config = None # Make config globally accessible
 speaker_latents_cache = {}
 
 async def load_tts_model():
     """Loads the Coqui XTTS model and configuration globally."""
-    global xtts_model
+    global xtts_model, xtts_config # Declare as global
     if xtts_model is None:
         if not XTTS_MODEL_DIR or not XTTS_CONFIG_PATH or not XTTS_CHECKPOINT_DIR:
             logging.error("XTTS model paths are not properly configured. Cannot load model.")
@@ -73,11 +74,11 @@ async def load_tts_model():
 
         logging.info(f"Loading Coqui XTTS-v2 model from {XTTS_MODEL_DIR}...")
         try:
-            config = XttsConfig()
-            config.load_json(XTTS_CONFIG_PATH)
+            xtts_config = XttsConfig() # Assign to global variable
+            xtts_config.load_json(XTTS_CONFIG_PATH)
 
-            xtts_model = Xtts.init_from_config(config)
-            xtts_model.load_checkpoint(config, checkpoint_dir=XTTS_CHECKPOINT_DIR, use_deepspeed=False)
+            xtts_model = Xtts.init_from_config(xtts_config)
+            xtts_model.load_checkpoint(xtts_config, checkpoint_dir=XTTS_CHECKPOINT_DIR, use_deepspeed=False)
 
             if torch.cuda.is_available():
                 xtts_model.cuda()
@@ -89,19 +90,18 @@ async def load_tts_model():
         except Exception as e:
             logging.error(f"Failed to load Coqui XTTS model: {e}")
             xtts_model = None
+            xtts_config = None
             raise
 
 async def get_speaker_latents(voice_clone_url, voice_id):
     """Downloads voice sample and computes speaker latents, caches them."""
+    # This function now also returns the local_path of the downloaded speaker WAV
     if voice_id in speaker_latents_cache:
         logging.info(f"Using cached speaker latents for voice {voice_id}")
-        return speaker_latents_cache[voice_id]
+        return speaker_latents_cache[voice_id]['latents'], speaker_latents_cache[voice_id]['local_path']
 
     logging.info(f"Downloading voice sample from: {voice_clone_url}")
     try:
-        # Create a unique directory for each voice sample
-        # Using a hash of the URL to ensure unique directory for unique URLs,
-        # but still using voice_id for cache key.
         url_hash = hashlib.md5(voice_clone_url.encode()).hexdigest()
         voice_sample_dir = os.path.join(TTS_MODEL_HOME, "voice_samples", url_hash)
         os.makedirs(voice_sample_dir, exist_ok=True)
@@ -109,7 +109,6 @@ async def get_speaker_latents(voice_clone_url, voice_id):
         file_extension = voice_clone_url.split('.')[-1].split('?')[0]
         local_path = os.path.join(voice_sample_dir, f"sample.{file_extension}")
 
-        # Check if file already exists in the local cache to avoid re-downloading
         if not os.path.exists(local_path):
             urllib.request.urlretrieve(voice_clone_url, local_path)
             logging.info(f"Voice sample downloaded to: {local_path}")
@@ -127,8 +126,8 @@ async def get_speaker_latents(voice_clone_url, voice_id):
         gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(audio_path=[local_path])
         logging.info(f"Speaker latents computed for {voice_id}.")
 
-        speaker_latents_cache[voice_id] = (gpt_cond_latent, speaker_embedding)
-        return gpt_cond_latent, speaker_embedding
+        speaker_latents_cache[voice_id] = {'latents': (gpt_cond_latent, speaker_embedding), 'local_path': local_path}
+        return (gpt_cond_latent, speaker_embedding), local_path
     except Exception as e:
         logging.error(f"Error downloading or processing voice sample/computing latents: {e}")
         return None, None
@@ -217,6 +216,7 @@ async def voice_chat_websocket_handler(request):
     gpt_cond_latent = None
     speaker_embedding = None
     language = 'en'
+    local_voice_path = None # Store the local path for WebSocket streaming
 
     try:
         async for msg in ws:
@@ -238,8 +238,8 @@ async def voice_chat_websocket_handler(request):
 
                         logging.info(f"Initializing voice for user {user_id}, avatar {avatar_id} from {voice_clone_url} in language {language}")
 
-                        gpt_cond_latent, speaker_embedding = await get_speaker_latents(voice_clone_url, avatar_id)
-                        if gpt_cond_latent is None or speaker_embedding is None:
+                        (gpt_cond_latent, speaker_embedding), local_voice_path = await get_speaker_latents(voice_clone_url, avatar_id)
+                        if gpt_cond_latent is None or speaker_embedding is None or local_voice_path is None:
                             await ws.send_json({"type": "error", "message": "Failed to load voice sample or compute latents."})
                             break # Exit message loop
 
@@ -255,6 +255,10 @@ async def voice_chat_websocket_handler(request):
                         if not text:
                             logging.warning("Received empty text_to_speak message.")
                             continue
+                        if local_voice_path is None:
+                            logging.error("Voice sample not initialized for streaming. Cannot generate speech.")
+                            await ws.send_json({"type": "error", "message": "Voice sample not initialized for streaming."})
+                            continue
 
                         logging.info(f"Generating speech for text: '{text[:50]}...' in language '{language}'")
                         await ws.send_json({"type": "speech_start"})
@@ -263,8 +267,10 @@ async def voice_chat_websocket_handler(request):
                         for chunk in xtts_model.inference_stream(
                             text=text,
                             language=language,
-                            gpt_cond_latent=gpt_cond_latent,
-                            speaker_embedding=speaker_embedding,
+                            speaker_wav=local_voice_path, # Pass speaker_wav for streaming
+                            gpt_cond_latent=gpt_cond_latent, # Still pass pre-computed latents
+                            speaker_embedding=speaker_embedding, # Still pass pre-computed embeddings
+                            # config=xtts_config # config is not typically needed for inference_stream
                         ):
                             audio_np = chunk.cpu().numpy()
                             audio_np_int16 = (audio_np * 32767).astype(np.int16)
@@ -338,21 +344,24 @@ async def generate_audio_http_handler(request):
         if not is_valid_lang:
             return web.json_response({"error": lang_error_msg}, status=400)
 
-        gpt_cond_latent, speaker_embedding = await get_speaker_latents(voice_clone_url, voice_id)
-        if gpt_cond_latent is None or speaker_embedding is None:
+        # Get latents AND local_path for the voice sample
+        (gpt_cond_latent, speaker_embedding), local_voice_path = await get_speaker_latents(voice_clone_url, voice_id)
+        if gpt_cond_latent is None or speaker_embedding is None or local_voice_path is None:
             return web.json_response({"error": "Failed to load voice sample or compute latents. Check voice_clone_url validity."}, status=500)
 
-        if xtts_model is None:
-            return web.json_response({"error": "XTTS model not loaded on server."}, status=500)
+        if xtts_model is None or xtts_config is None: # Check for xtts_config as well
+            return web.json_response({"error": "XTTS model or config not loaded on server."}, status=500)
 
         logging.info(f"Generating non-streaming speech for voice {voice_id} (text: '{text[:50]}...') in language {language}")
 
-        # CRITICAL FIX: Use xtts_model.synthesize instead of xtts_model.generate_speech
+        # CRITICAL FIX: Use xtts_model.synthesize with correct parameters
         audio_array = xtts_model.synthesize(
             text=text,
+            config=xtts_config, # Pass the global config object
+            speaker_wav=local_voice_path, # Pass the path to the downloaded speaker WAV
             language=language,
-            gpt_cond_latent=gpt_cond_latent,
-            speaker_embedding=speaker_embedding,
+            gpt_cond_latent=gpt_cond_latent, # Still pass pre-computed latents
+            speaker_embedding=speaker_embedding, # Still pass pre-computed embeddings
         )
 
         # Convert float32 numpy array to int16 WAV bytes
