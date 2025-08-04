@@ -347,8 +347,8 @@ async def generate_audio_http_handler(request):
 
         logging.info(f"Generating non-streaming speech for voice {voice_id} (text: '{text[:50]}...') in language {language}")
 
-        # Generate audio (non-streaming)
-        audio_array = xtts_model.generate_speech(
+        # CRITICAL FIX: Use xtts_model.synthesize instead of xtts_model.generate_speech
+        audio_array = xtts_model.synthesize(
             text=text,
             language=language,
             gpt_cond_latent=gpt_cond_latent,
