@@ -8,7 +8,8 @@ import hmac
 import time
 import base64
 import io
-import urllib.request 
+import urllib.request
+from aiohttp import web # NEW: For HTTP server
 
 import torch
 from TTS.tts.configs.xtts_config import XttsConfig
@@ -24,10 +25,10 @@ logging.getLogger('websockets.server').setLevel(logging.WARNING)
 logging.getLogger('websockets.protocol').setLevel(logging.WARNING)
 logging.getLogger('TTS.api').setLevel(logging.WARNING)
 logging.getLogger('TTS.utils.io').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING) # Suppress urllib3 warnings
-logging.getLogger('huggingface_hub').setLevel(logging.WARNING) # Suppress huggingface_hub warnings
-logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING) # Suppress matplotlib font warnings
-logging.getLogger('fsspec').setLevel(logging.WARNING) # Suppress fsspec warnings
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('huggingface_hub').setLevel(logging.WARNING)
+logging.getLogger('matplotlib.font_manager').setLevel(logging.WARNING)
+logging.getLogger('fsspec').setLevel(logging.WARNING)
 
 
 # --- Configuration ---
@@ -35,25 +36,19 @@ VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
 VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765))
 VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
 
-# TTS_HOME will be set by the Dockerfile during build and available at runtime
-# This is also set as HF_HOME in the Dockerfile.
 TTS_MODEL_HOME = os.environ.get("TTS_HOME")
 if not TTS_MODEL_HOME:
     logging.error("TTS_HOME environment variable not set. Model loading might fail.")
     TTS_MODEL_HOME = os.path.expanduser("~/.local/share/tts")
 
 # Define the full path to the directory containing the downloaded model files
-# This is where download_model.py places the files (HF_HOME root)
-XTTS_MODEL_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # This gets the latest snapshot hash dynamically
-
-# FIX: Changed XTTS_MODEL_HOME to TTS_MODEL_HOME in the following two lines
-XTTS_CONFIG_PATH = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0], "config.json")
-XTTS_CHECKPOINT_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0]) # checkpoint_dir is the directory containing model.pth, etc.
+XTTS_MODEL_DIR = os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots", os.listdir(os.path.join(TTS_MODEL_HOME, "models--coqui--XTTS-v2", "snapshots"))[0])
+XTTS_CONFIG_PATH = os.path.join(XTTS_MODEL_DIR, "config.json") # Corrected path
+XTTS_CHECKPOINT_DIR = XTTS_MODEL_DIR # checkpoint_dir is the directory containing model.pth, etc.
 
 
 # --- Coqui TTS Model Loading ---
 xtts_model = None
-# Cache speaker latents (gpt_cond_latent, speaker_embedding) for performance
 speaker_latents_cache = {}
 
 async def load_tts_model():
@@ -62,18 +57,12 @@ async def load_tts_model():
     if xtts_model is None:
         logging.info(f"Loading Coqui XTTS-v2 model from {XTTS_MODEL_DIR}...")
         try:
-            # 1. Load config
             config = XttsConfig()
             config.load_json(XTTS_CONFIG_PATH)
 
-            # 2. Initialize model
             xtts_model = Xtts.init_from_config(config)
-
-            # 3. Load checkpoint
-            # use_deepspeed=False for now, as it adds complexity and might not be needed initially
             xtts_model.load_checkpoint(config, checkpoint_dir=XTTS_CHECKPOINT_DIR, use_deepspeed=False)
 
-            # 4. Move model to GPU if available
             if torch.cuda.is_available():
                 xtts_model.cuda()
                 logging.info("Coqui XTTS-v2 model moved to CUDA (GPU).")
@@ -86,44 +75,42 @@ async def load_tts_model():
             xtts_model = None
             raise
 
-async def get_speaker_latents(voice_clone_url, avatar_id):
+async def get_speaker_latents(voice_clone_url, voice_id): # Changed avatar_id to voice_id for clarity
     """Downloads voice sample and computes speaker latents, caches them."""
-    if avatar_id in speaker_latents_cache:
-        logging.info(f"Using cached speaker latents for avatar {avatar_id}")
-        return speaker_latents_cache[avatar_id]
+    if voice_id in speaker_latents_cache:
+        logging.info(f"Using cached speaker latents for voice {voice_id}")
+        return speaker_latents_cache[voice_id]
 
     logging.info(f"Downloading voice sample from: {voice_clone_url}")
     try:
-        # Create a unique directory for each avatar's voice sample to avoid conflicts
-        avatar_sample_dir = os.path.join(TTS_MODEL_HOME, "voice_samples", str(avatar_id))
-        os.makedirs(avatar_sample_dir, exist_ok=True)
+        # Create a unique directory for each voice sample
+        voice_sample_dir = os.path.join(TTS_MODEL_HOME, "voice_samples", str(voice_id))
+        os.makedirs(voice_sample_dir, exist_ok=True)
 
-        file_extension = voice_clone_url.split('.')[-1].split('?')[0] # Handle query params in URL
-        local_path = os.path.join(avatar_sample_dir, f"sample.{file_extension}")
+        file_extension = voice_clone_url.split('.')[-1].split('?')[0]
+        local_path = os.path.join(voice_sample_dir, f"sample.{file_extension}")
 
         urllib.request.urlretrieve(voice_clone_url, local_path)
 
         logging.info(f"Voice sample downloaded to: {local_path}")
 
-        # Compute speaker latents
         if xtts_model is None:
             raise RuntimeError("XTTS model not loaded to compute speaker latents.")
 
-        # Ensure model is on the correct device for get_conditioning_latents
         device = "cuda" if torch.cuda.is_available() else "cpu"
         xtts_model.to(device)
 
-        logging.info(f"Computing speaker latents for {avatar_id} on {device}...")
+        logging.info(f"Computing speaker latents for {voice_id} on {device}...")
         gpt_cond_latent, speaker_embedding = xtts_model.get_conditioning_latents(audio_path=[local_path])
-        logging.info(f"Speaker latents computed for {avatar_id}.")
+        logging.info(f"Speaker latents computed for {voice_id}.")
 
-        speaker_latents_cache[avatar_id] = (gpt_cond_latent, speaker_embedding)
+        speaker_latents_cache[voice_id] = (gpt_cond_latent, speaker_embedding)
         return gpt_cond_latent, speaker_embedding
     except Exception as e:
         logging.error(f"Error downloading or processing voice sample/computing latents: {e}")
         return None, None
 
-# --- WebSocket Authentication ---
+# --- Authentication ---
 def verify_auth_token(token_header):
     """Verifies the custom VOICE_CLONE_AUTH token."""
     if not token_header or not token_header.startswith("VOICE_CLONE_AUTH-"):
@@ -132,7 +119,6 @@ def verify_auth_token(token_header):
 
     try:
         encoded_payload = token_header.split("VOICE_CLONE_AUTH-")[1]
-        # Add padding back for base64urldecode if missing
         missing_padding = len(encoded_payload) % 4
         if missing_padding:
             encoded_payload += '=' * (4 - missing_padding)
@@ -141,12 +127,10 @@ def verify_auth_token(token_header):
         signature, timestamp_str = decoded_payload.split('.')
         timestamp = int(timestamp_str)
 
-        # Check timestamp for freshness (e.g., within 5 minutes)
         if abs(time.time() - timestamp) > 300: # 300 seconds = 5 minutes
             logging.warning(f"Auth token expired or too old. Timestamp: {timestamp}, Current: {time.time()}")
             return False
 
-        # Verify signature
         string_to_sign = str(timestamp)
         expected_signature = hmac.new(
             VOICE_SERVICE_SECRET_KEY.encode('utf-8'),
@@ -163,12 +147,32 @@ def verify_auth_token(token_header):
         logging.error(f"Error verifying auth token: {e}")
         return False
 
-# --- WebSocket Handler ---
+# --- Language Validation (for HTTP endpoint) ---
+def validate_text_for_language(text, language):
+    """
+    Performs basic validation of text content based on the selected language.
+    This is a simple regex-based check and can be expanded for more robustness.
+    """
+    if language == 'hi':
+        # Check for presence of Devanagari script characters
+        hindi_regex = r'[\u0900-\u097F]'
+        if not any(char for char in text if '\u0900' <= char <= '\u097F'):
+            return False, "Text must contain Hindi (Devanagari) characters for Hindi language."
+    elif language == 'en':
+        # Basic check for non-English characters if English is strictly enforced
+        # For XTTS, it's generally flexible, but if you want strict validation:
+        # english_regex = r'^[a-zA-Z0-9\s.,!?;:\-_\'"()]+$'
+        # if not re.match(english_regex, text):
+        #     return False, "Text must be in English for English language."
+        pass # No strict enforcement for English for now
+    # Add more language-specific checks as needed
+    return True, None
+
+# --- WebSocket Handler (Existing Real-time Chat) ---
 async def voice_chat_websocket_handler(websocket, path):
     """Handles incoming WebSocket connections for real-time voice chat."""
     logging.info(f"New WebSocket connection from {websocket.remote_address}")
 
-    # Authenticate the connection
     auth_token = websocket.request_headers.get('Authorization')
     if not verify_auth_token(auth_token):
         logging.error("WebSocket connection rejected: Invalid or missing authentication token.")
@@ -181,10 +185,9 @@ async def voice_chat_websocket_handler(websocket, path):
     avatar_id = None
     gpt_cond_latent = None
     speaker_embedding = None
-    language = 'en' # NEW: Initialize language
+    language = 'en'
 
     try:
-        # First message should be 'init'
         init_message_raw = await websocket.recv()
         init_message = json.loads(init_message_raw)
 
@@ -196,15 +199,16 @@ async def voice_chat_websocket_handler(websocket, path):
         user_id = init_message.get('userId')
         avatar_id = init_message.get('avatarId')
         voice_clone_url = init_message.get('voice_clone_url')
-        language = init_message.get('language', 'en') # NEW: Get language from init message
+        language = init_message.get('language', 'en')
 
         if not all([user_id, avatar_id, voice_clone_url]):
             logging.error("Missing init parameters. Closing connection.")
             await websocket.send(json.dumps({"type": "error", "message": "Missing userId, avatarId, or voice_clone_url in init."}))
             return
 
-        logging.info(f"Initializing voice for user {user_id}, avatar {avatar_id} from {voice_clone_url} in language {language}") # NEW: Log language
+        logging.info(f"Initializing voice for user {user_id}, avatar {avatar_id} from {voice_clone_url} in language {language}")
 
+        # Use avatar_id as voice_id for caching speaker latents in real-time chat
         gpt_cond_latent, speaker_embedding = await get_speaker_latents(voice_clone_url, avatar_id)
         if gpt_cond_latent is None or speaker_embedding is None:
             await websocket.send(json.dumps({"type": "error", "message": "Failed to load voice sample or compute latents."}))
@@ -228,29 +232,20 @@ async def voice_chat_websocket_handler(websocket, path):
                         logging.warning("Received empty text_to_speak message.")
                         continue
 
-                    logging.info(f"Generating speech for text: '{text[:50]}...' in language '{language}'") # NEW: Log language
+                    logging.info(f"Generating speech for text: '{text[:50]}...' in language '{language}'")
                     await websocket.send(json.dumps({"type": "speech_start"}))
 
-                    # Generate and stream audio chunks using inference_stream
                     for chunk in xtts_model.inference_stream(
                         text=text,
-                        language=language, # NEW: Pass language to XTTS
+                        language=language,
                         gpt_cond_latent=gpt_cond_latent,
                         speaker_embedding=speaker_embedding,
-                        # Add other inference parameters if needed, e.g., temperature, top_k, top_p
                     ):
-                        # `chunk` is a torch.Tensor (float32). Convert to numpy and then to WAV bytes.
                         audio_np = chunk.cpu().numpy()
-
-                        # Normalize float32 to int16 range and convert type for WAV
-                        # XTTS outputs float32 in range [-1, 1]. Convert to int16.
-                        # Multiply by 32767 for the full range of int16.
                         audio_np_int16 = (audio_np * 32767).astype(np.int16)
 
-                        # Create an in-memory WAV file for each chunk
                         wav_buffer = io.BytesIO()
-                        # XTTS-v2 typically outputs at 24000 Hz sample rate
-                        wavfile.write(wav_buffer, 24000, audio_np_int16)
+                        wavfile.write(wav_buffer, 24000, audio_np_int16) # XTTS-v2 typically outputs at 24000 Hz
                         wav_bytes = wav_buffer.getvalue()
 
                         await websocket.send(wav_bytes)
@@ -260,7 +255,7 @@ async def voice_chat_websocket_handler(websocket, path):
 
                 elif msg_type == 'stop_speaking':
                     logging.info("Received stop_speaking command. (Coqui TTS handles interruption internally if it's mid-stream)")
-                    await websocket.send(json.dumps({"type": "speech_end"})) # Ensure frontend gets end signal
+                    await websocket.send(json.dumps({"type": "speech_end"}))
 
                 else:
                     logging.warning(f"Received unknown message type: {msg_type}")
@@ -280,20 +275,112 @@ async def voice_chat_websocket_handler(websocket, path):
     finally:
         logging.info(f"Cleaning up connection for user {user_id}.")
 
+
+# --- HTTP Handler (NEW: For Non-Real-time Audio Generation) ---
+async def generate_audio_http_handler(request):
+    """
+    Handles HTTP POST requests to generate audio from text using a specific voice.
+    Expects JSON payload: {"voice_id": "uuid", "text": "string", "language": "string"}
+    Returns WAV audio file.
+    """
+    logging.info(f"New HTTP request to /generate-audio from {request.remote}")
+
+    # Authentication for HTTP endpoint (reusing the same secret key logic)
+    auth_header = request.headers.get('Authorization')
+    if not verify_auth_token(auth_header):
+        logging.error("HTTP request rejected: Invalid or missing authentication token.")
+        return web.json_response({"error": "Authentication Failed"}, status=401)
+
+    try:
+        data = await request.json()
+        voice_id = data.get('voice_id')
+        text = data.get('text')
+        language = data.get('language', 'en') # Default to English
+
+        if not all([voice_id, text, text.strip()]):
+            return web.json_response({"error": "Missing 'voice_id' or 'text' in request body."}, status=400)
+
+        is_valid_lang, lang_error_msg = validate_text_for_language(text, language)
+        if not is_valid_lang:
+            return web.json_response({"error": lang_error_msg}, status=400)
+
+        # Retrieve voice URL from Supabase (via backend service cache)
+        # The backend Node.js service will fetch the voice_url from Supabase and pass it here.
+        # So, this voice_service assumes voice_clone_url is directly provided if voice_id is given.
+        # This means the Node.js backend needs to fetch the audio_url from the 'voices' table
+        # and pass it as 'voice_clone_url' in the HTTP request to this service.
+        voice_clone_url = data.get('voice_clone_url') # Expect Node.js backend to provide this
+
+        if not voice_clone_url:
+            logging.error(f"Voice clone URL not provided for voice_id: {voice_id}. Cannot generate audio.")
+            return web.json_response({"error": "Voice clone URL not provided by backend."}, status=400)
+
+        gpt_cond_latent, speaker_embedding = await get_speaker_latents(voice_clone_url, voice_id)
+        if gpt_cond_latent is None or speaker_embedding is None:
+            return web.json_response({"error": "Failed to load voice sample or compute latents."}, status=500)
+
+        if xtts_model is None:
+            return web.json_response({"error": "XTTS model not loaded on server."}, status=500)
+
+        logging.info(f"Generating non-streaming speech for voice {voice_id} (text: '{text[:50]}...') in language {language}")
+
+        # Generate audio (non-streaming)
+        # xtts_model.generate_speech returns a numpy array
+        audio_array = xtts_model.generate_speech(
+            text=text,
+            language=language,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+            # Add other inference parameters if needed
+        )
+
+        # Convert float32 numpy array to int16 WAV bytes
+        audio_np_int16 = (audio_array * 32767).astype(np.int16)
+        wav_buffer = io.BytesIO()
+        wavfile.write(wav_buffer, 24000, audio_np_int16) # XTTS-v2 typically outputs at 24000 Hz
+        wav_bytes = wav_buffer.getvalue()
+
+        logging.info(f"Successfully generated audio for voice {voice_id}.")
+        return web.Response(body=wav_bytes, content_type='audio/wav')
+
+    except json.JSONDecodeError:
+        logging.error("Invalid JSON in HTTP request body.")
+        return web.json_response({"error": "Invalid JSON in request body."}, status=400)
+    except Exception as e:
+        logging.error(f"Error in HTTP audio generation handler: {e}", exc_info=True)
+        return web.json_response({"error": f"Internal server error: {e}"}, status=500)
+
+
+# --- Main Application Setup ---
 async def main():
-    """Main function to start the WebSocket server."""
-    # Ensure the model is loaded before starting the server
+    """Main function to start both WebSocket and HTTP servers."""
     await load_tts_model()
 
-    logging.info(f"Starting Python Voice Service on ws://{VOICE_SERVICE_HOST}:{VOICE_SERVICE_PORT}")
-    server = await websockets.serve(
+    # Setup HTTP application
+    app = web.Application()
+    app.router.add_post('/generate-audio', generate_audio_http_handler) # NEW HTTP endpoint
+
+    # Create a runner for the aiohttp app
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, VOICE_SERVICE_HOST, VOICE_SERVICE_PORT)
+
+    # Start the HTTP server
+    await site.start()
+    logging.info(f"HTTP server running on http://{VOICE_SERVICE_HOST}:{VOICE_SERVICE_PORT}/generate-audio")
+
+    # Start the WebSocket server
+    ws_server = await websockets.serve(
         voice_chat_websocket_handler,
         VOICE_SERVICE_HOST,
         VOICE_SERVICE_PORT,
-        ping_interval=None, # Disable ping/pong for simplicity, can add if needed
+        ping_interval=None,
         ping_timeout=None
     )
-    await server.wait_closed()
+    logging.info(f"WebSocket server running on ws://{VOICE_SERVICE_HOST}:{VOICE_SERVICE_PORT}")
+
+    # Keep both servers running indefinitely
+    await asyncio.Future() # This will keep the event loop running
 
 if __name__ == "__main__":
     if not VOICE_SERVICE_SECRET_KEY:
