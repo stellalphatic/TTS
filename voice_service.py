@@ -62,7 +62,7 @@ except IndexError:
 # --- Coqui TTS Model Loading ---
 xtts_model = None
 xtts_config = None # Make config globally accessible
-speaker_latents_cache = {}
+speaker_latents_cache = {} # Cache for pre-computed latents (used by streaming)
 
 async def load_tts_model():
     """Loads the Coqui XTTS model and configuration globally."""
@@ -94,10 +94,13 @@ async def load_tts_model():
             raise
 
 async def get_speaker_latents(voice_clone_url, voice_id):
-    """Downloads voice sample and computes speaker latents, caches them."""
-    # This function now also returns the local_path of the downloaded speaker WAV
+    """
+    Downloads voice sample and computes speaker latents, caches them.
+    Returns (gpt_cond_latent, speaker_embedding) and the local_path.
+    This function is primarily used to pre-compute latents for streaming.
+    """
     if voice_id in speaker_latents_cache:
-        logging.info(f"Using cached speaker latents for voice {voice_id}")
+        logging.info(f"Using cached speaker latents and path for voice {voice_id}")
         return speaker_latents_cache[voice_id]['latents'], speaker_latents_cache[voice_id]['local_path']
 
     logging.info(f"Downloading voice sample from: {voice_clone_url}")
@@ -344,24 +347,26 @@ async def generate_audio_http_handler(request):
         if not is_valid_lang:
             return web.json_response({"error": lang_error_msg}, status=400)
 
-        # Get latents AND local_path for the voice sample
-        (gpt_cond_latent, speaker_embedding), local_voice_path = await get_speaker_latents(voice_clone_url, voice_id)
-        if gpt_cond_latent is None or speaker_embedding is None or local_voice_path is None:
-            return web.json_response({"error": "Failed to load voice sample or compute latents. Check voice_clone_url validity."}, status=500)
+        # For HTTP synthesize, we only need the local_path.
+        # The latents (gpt_cond_latent, speaker_embedding) are re-computed internally by synthesize from speaker_wav.
+        # We still call get_speaker_latents to ensure the file is downloaded and cached.
+        _, local_voice_path = await get_speaker_latents(voice_clone_url, voice_id)
+        if local_voice_path is None:
+            return web.json_response({"error": "Failed to download voice sample. Check voice_clone_url validity."}, status=500)
 
         if xtts_model is None or xtts_config is None: # Check for xtts_config as well
             return web.json_response({"error": "XTTS model or config not loaded on server."}, status=500)
 
         logging.info(f"Generating non-streaming speech for voice {voice_id} (text: '{text[:50]}...') in language {language}")
 
-        # CRITICAL FIX: Use xtts_model.synthesize with correct parameters
+        # CRITICAL FIX: Use xtts_model.synthesize with correct parameters.
+        # DO NOT pass gpt_cond_latent or speaker_embedding directly to synthesize.
+        # synthesize will compute them from speaker_wav.
         audio_array = xtts_model.synthesize(
             text=text,
             config=xtts_config, # Pass the global config object
             speaker_wav=local_voice_path, # Pass the path to the downloaded speaker WAV
             language=language,
-            gpt_cond_latent=gpt_cond_latent, # Still pass pre-computed latents
-            speaker_embedding=speaker_embedding, # Still pass pre-computed embeddings
         )
 
         # Convert float32 numpy array to int16 WAV bytes
