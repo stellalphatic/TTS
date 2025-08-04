@@ -200,9 +200,14 @@ async def voice_chat_websocket_handler(request):
     logging.info(f"New WebSocket connection from {request.remote}")
 
     auth_token = request.headers.get('Authorization')
+    if not auth_token: # Check for header existence
+        logging.error("WebSocket connection rejected: Missing Authorization header.")
+        await ws.close(code=1008, reason="Authentication Failed: Missing Authorization header.")
+        return ws
+
     if not verify_auth_token(auth_token):
-        logging.error("WebSocket connection rejected: Invalid or missing authentication token.")
-        await ws.close(code=1008, reason="Authentication Failed")
+        logging.error("WebSocket connection rejected: Invalid authentication token.")
+        await ws.close(code=1008, reason="Authentication Failed: Invalid token.")
         return ws # Return the WebSocketResponse object
 
     logging.info("WebSocket connection authenticated.")
@@ -387,8 +392,8 @@ async def main():
     await site.start()
     logging.info(f"Python Voice Service running on http://{VOICE_SERVICE_HOST}:{VOICE_SERVICE_PORT} (HTTP) and ws://{VOICE_SERVICE_HOST}:{VOICE_SERVICE_PORT}/ws (WebSocket)")
 
-    # Keep the server running indefinitely by awaiting the runner to stop
-    await runner.wait_closed() # This replaces asyncio.Future() for aiohttp apps
+    # Keep the server running indefinitely by awaiting a Future that never completes
+    await asyncio.Future()
 
 if __name__ == "__main__":
     if not VOICE_SERVICE_SECRET_KEY:
