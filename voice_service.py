@@ -347,46 +347,36 @@ async def generate_audio_http_handler(request):
         if not is_valid_lang:
             return web.json_response({"error": lang_error_msg}, status=400)
 
-        # For HTTP synthesize, we only need the local_path.
-        # The latents (gpt_cond_latent, speaker_embedding) are re-computed internally by synthesize from speaker_wav.
-        # We still call get_speaker_latents to ensure the file is downloaded and cached.
-        _, local_voice_path = await get_speaker_latents(voice_clone_url, voice_id)
-        if local_voice_path is None:
-            return web.json_response({"error": "Failed to download voice sample. Check voice_clone_url validity."}, status=500)
+        # Get speaker latents and local path (will be cached after first download)
+        (gpt_cond_latent, speaker_embedding), local_voice_path = await get_speaker_latents(voice_clone_url, voice_id)
+        if gpt_cond_latent is None or speaker_embedding is None or local_voice_path is None:
+            return web.json_response({"error": "Failed to download voice sample or compute latents. Check voice_clone_url validity."}, status=500)
 
-        if xtts_model is None or xtts_config is None: # Check for xtts_config as well
-            return web.json_response({"error": "XTTS model or config not loaded on server."}, status=500)
+        if xtts_model is None:
+            return web.json_response({"error": "XTTS model not loaded on server."}, status=500)
 
-        logging.info(f"Generating non-streaming speech for voice {voice_id} (text: '{text[:50]}...') in language {language}")
+        logging.info(f"Generating non-streaming speech for voice {voice_id} (text: '{text[:50]}...') in language {language} using inference_stream")
 
-        # CRITICAL FIX: Use xtts_model.synthesize with correct parameters.
-        # DO NOT pass gpt_cond_latent or speaker_embedding directly to synthesize.
-        # synthesize will compute them from speaker_wav.
-        audio_array = xtts_model.synthesize(
+        # Use inference_stream and collect all chunks
+        audio_chunks = []
+        for chunk in xtts_model.inference_stream(
             text=text,
-            config=xtts_config, # Pass the global config object
-            speaker_wav=local_voice_path, # Pass the path to the downloaded speaker WAV
             language=language,
-        )
+            speaker_wav=local_voice_path,
+            gpt_cond_latent=gpt_cond_latent,
+            speaker_embedding=speaker_embedding,
+        ):
+            audio_chunks.append(chunk.cpu().numpy())
 
-        # --- DEBUGGING ADDITION ---
-        logging.info(f"DEBUG: Type returned by synthesize: {type(audio_array)}")
-        if isinstance(audio_array, dict):
-            logging.error(f"DEBUG: synthesize returned a dictionary: {audio_array}")
-            # If it's a dict, it's an unexpected error from the model.
-            return web.json_response({"error": "Internal voice service error: Model synthesis returned unexpected data (dictionary)."}, status=500)
-        # --- END DEBUGGING ADDITION ---
+        if not audio_chunks:
+            logging.error("inference_stream yielded no audio chunks.")
+            return web.json_response({"error": "Internal voice service error: No audio chunks generated."}, status=500)
 
-        # Ensure it's a numpy array before multiplication
-        # This check is technically redundant if synthesize always returns torch.Tensor,
-        # but good for robustness if it sometimes returns other array-like objects.
-        if not isinstance(audio_array, torch.Tensor):
-            logging.error(f"Synthesize returned unexpected type: {type(audio_array)}. Expected torch.Tensor.")
-            return web.json_response({"error": "Internal voice service error: Model synthesis returned non-tensor data."}, status=500)
+        # Concatenate all chunks into a single numpy array
+        full_audio_np = np.concatenate(audio_chunks)
 
-        audio_np = audio_array.cpu().numpy()
-        audio_np_int16 = (audio_np * 32767).astype(np.int16)
-
+        # Convert float32 numpy array to int16 WAV bytes
+        audio_np_int16 = (full_audio_np * 32767).astype(np.int16)
         wav_buffer = io.BytesIO()
         wavfile.write(wav_buffer, 24000, audio_np_int16) # XTTS-v2 typically outputs at 24000 Hz
         wav_bytes = wav_buffer.getvalue()
