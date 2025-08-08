@@ -35,7 +35,7 @@ logging.getLogger('aiohttp.access').setLevel(logging.WARNING) # Suppress aiohttp
 
 # --- Configuration ---
 VOICE_SERVICE_SECRET_KEY = os.environ.get("VOICE_SERVICE_SECRET_KEY")
-VOICE_SERVICE_PORT = int(os.environ.get("PORT", 8765))
+VOICE_SERVICE_PORT = int(os.environ.get("VOICE_SERVICE_PORT", 8765))
 VOICE_SERVICE_HOST = os.environ.get("VOICE_SERVICE_HOST", "0.0.0.0")
 
 TTS_MODEL_HOME = os.environ.get("TTS_HOME")
