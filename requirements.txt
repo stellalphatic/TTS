@@ -1,9 +1,9 @@
-websockets==12.0
+websockets
 torch==2.1.0
 torchaudio==2.1.0
-TTS==0.22.0
-numpy==1.22.0
-scipy==1.11.2
-huggingface_hub==0.23.0
-transformers==4.35.2
-aiohttp==3.9.5 # for HTTP server
+TTS
+numpy
+scipy
+huggingface_hub
+transformers
+aiohttp
