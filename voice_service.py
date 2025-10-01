@@ -487,6 +487,20 @@ async def video_stream_handler(request):
     return ws
 
 
+# --- Health Check Handler ---
+async def health_check_handler(request):
+    """
+    Handles health check requests. Checks if the XTTS model is loaded.
+    """
+    global xtts_model
+    
+    if xtts_model is not None:
+        return web.json_response({"status": "ok", "model_loaded": True}, status=200)
+    else:
+        logging.error("Health check failed: XTTS model is NOT loaded.")
+        return web.json_response({"status": "error", "model_loaded": False, "message": "XTTS model not initialized"}, status=503)
+
+
 # --- Main Application Setup ---
 async def main():
     """Main function to start the aiohttp server handling both HTTP and WebSocket."""
@@ -494,14 +508,16 @@ async def main():
 
     app = web.Application()
     
+    app.router.add_get('/health', health_check_handler) 
+
     # HTTP route for audio generation
     app.router.add_post('/generate-audio', generate_audio_http_handler)
     
     # WebSocket route for real-time voice chat
-    app.router.add_get('/ws', voice_chat_websocket_handler) # Existing
+    app.router.add_get('/ws', voice_chat_websocket_handler) 
     
     # NEW: WebSocket route for video streaming audio
-    app.router.add_get('/ws-video-stream', video_stream_handler) # New
+    app.router.add_get('/ws-video-stream', video_stream_handler)
 
     runner = web.AppRunner(app)
     await runner.setup()
